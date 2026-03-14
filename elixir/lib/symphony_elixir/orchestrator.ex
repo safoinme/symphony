@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, DispatchRouter, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -558,6 +558,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
+      !gate_state?(issue.state) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -567,6 +568,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp gate_state?(state_name) when is_binary(state_name) do
+    case Config.state_action(state_name) do
+      %{"action" => "gate"} -> true
+      _ -> false
+    end
+  end
+
+  defp gate_state?(_state_name), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -677,6 +687,82 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp dispatch_issue_to_runner(issue, recipient, attempt, worker_host) do
+    case DispatchRouter.route(issue) do
+      {:agent, backend, backend_opts} ->
+        opts = Keyword.merge([attempt: attempt, worker_host: worker_host, backend: backend], backend_opts)
+        AgentRunner.run(issue, recipient, opts)
+
+      {:plan, backend, plan_opts} ->
+        case maybe_skip_planning(issue) do
+          :dispatch ->
+            opts = Keyword.merge([worker_host: worker_host, backend: backend], plan_opts)
+            SymphonyElixir.PlanningRunner.run(issue, recipient, opts)
+
+          :skip_complete ->
+            Logger.info("Planning already complete for #{issue_context(issue)}, waiting for human to move to In Progress")
+
+          :skip_waiting ->
+            Logger.info("Questions pending for #{issue_context(issue)}, waiting for human answers")
+        end
+
+      {:review, backend, review_opts} ->
+        opts = Keyword.merge([worker_host: worker_host, backend: backend], review_opts)
+        SymphonyElixir.ReviewRunner.run(issue, recipient, opts)
+
+      :gate ->
+        Logger.warning("Gate state issue reached dispatch: #{issue_context(issue)}")
+
+      :skip ->
+        Logger.debug("No action configured for state #{issue.state}: #{issue_context(issue)}")
+    end
+  end
+
+  defp maybe_skip_planning(issue) do
+    case Workspace.workspace_path(issue.identifier) do
+      {:ok, workspace} ->
+        cond do
+          SymphonyElixir.PlanningRunner.planning_complete?(workspace) ->
+            :skip_complete
+
+          SymphonyElixir.PlanningRunner.questions_pending?(workspace) ->
+            if has_new_human_replies?(issue, workspace), do: :dispatch, else: :skip_waiting
+
+          true ->
+            :dispatch
+        end
+
+      {:error, _} ->
+        :dispatch
+    end
+  end
+
+  defp has_new_human_replies?(issue, workspace) do
+    questions_mtime = SymphonyElixir.PlanningRunner.questions_file_mtime(workspace)
+
+    case {questions_mtime, Tracker.fetch_issue_comments(issue.id)} do
+      {nil, _} ->
+        false
+
+      {_mtime, {:ok, comments}} ->
+        Enum.any?(comments, fn comment ->
+          not comment.is_bot and newer_than_mtime?(comment.created_at, questions_mtime)
+        end)
+
+      _ ->
+        false
+    end
+  end
+
+  defp newer_than_mtime?(comment_timestamp, mtime) when is_binary(comment_timestamp) do
+    case DateTime.from_iso8601(comment_timestamp) do
+      {:ok, comment_dt, _offset} -> DateTime.compare(comment_dt, mtime) == :gt
+      _ -> false
+    end
+  end
+
+  defp newer_than_mtime?(_comment_timestamp, _mtime), do: false
+
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
@@ -692,12 +778,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           dispatch_issue_to_runner(issue, recipient, attempt, worker_host)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+
+        {route_action, route_backend_type} = dispatch_route_info(issue)
 
         running =
           Map.put(state.running, issue.id, %{
@@ -720,7 +808,10 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            branch_name: Map.get(issue, :branch_name),
+            backend_type: route_backend_type,
+            action: route_action
           })
 
         %{
@@ -741,6 +832,20 @@ defmodule SymphonyElixir.Orchestrator do
         })
     end
   end
+
+  defp dispatch_route_info(issue) do
+    case DispatchRouter.route(issue) do
+      {:agent, module, _opts} -> {"agent", backend_type_name(module)}
+      {:plan, module, _opts} -> {"plan", backend_type_name(module)}
+      {:review, module, _opts} -> {"review", backend_type_name(module)}
+      :gate -> {"gate", nil}
+      :skip -> {"skip", nil}
+    end
+  end
+
+  defp backend_type_name(SymphonyElixir.AgentBackend.ClaudeCode), do: "claude_code"
+  defp backend_type_name(SymphonyElixir.AgentBackend.Codex), do: "codex"
+  defp backend_type_name(_module), do: "unknown"
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
@@ -1122,7 +1227,10 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          branch_name: Map.get(metadata, :branch_name),
+          backend_type: Map.get(metadata, :backend_type),
+          action: Map.get(metadata, :action)
         }
       end)
 
@@ -1180,8 +1288,11 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
+    cmux_fields = extract_cmux_fields(running_entry, update)
+
     {
-      Map.merge(running_entry, %{
+      running_entry
+      |> Map.merge(%{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -1194,7 +1305,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
+      })
+      |> Map.merge(cmux_fields),
       token_delta
     }
   end
@@ -1215,7 +1327,39 @@ defmodule SymphonyElixir.Orchestrator do
   defp session_id_for_update(_existing, %{session_id: session_id}) when is_binary(session_id),
     do: session_id
 
+  # Claude Code backend: session_id is nested in payload
+  defp session_id_for_update(existing, %{payload: payload}) when is_map(payload) do
+    case payload["session_id"] || payload["sessionId"] do
+      id when is_binary(id) and id != "" -> id
+      _ -> existing
+    end
+  end
+
   defp session_id_for_update(existing, _update), do: existing
+
+  defp extract_cmux_fields(running_entry, %{payload: payload}) when is_map(payload) do
+    ref = Map.get(payload, "cmux_workspace_ref")
+    cmd = Map.get(payload, "cmux_attach_cmd")
+
+    fields = %{}
+    fields = if is_binary(ref) and ref != "", do: Map.put(fields, :cmux_workspace_ref, ref), else: fields
+    fields = if is_binary(cmd) and cmd != "", do: Map.put(fields, :cmux_attach_cmd, cmd), else: fields
+
+    # Preserve existing values if not overwritten
+    if fields == %{} do
+      %{}
+    else
+      Map.merge(
+        %{
+          cmux_workspace_ref: Map.get(running_entry, :cmux_workspace_ref),
+          cmux_attach_cmd: Map.get(running_entry, :cmux_attach_cmd)
+        },
+        fields
+      )
+    end
+  end
+
+  defp extract_cmux_fields(_running_entry, _update), do: %{}
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1409,15 +1553,25 @@ defmodule SymphonyElixir.Orchestrator do
       update[:usage],
       Map.get(update, "usage"),
       Map.get(update, :usage),
+      # Claude Code: usage nested one level inside the NDJSON event payload
+      get_in(update, [:payload, "usage"]),
+      get_in(update, [:payload, :usage]),
       update[:payload],
       Map.get(update, "payload"),
       update
     ]
 
-    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
+    Enum.find_value(payloads, &direct_token_usage/1) ||
+      Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
       %{}
   end
+
+  defp direct_token_usage(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload
+  end
+
+  defp direct_token_usage(_payload), do: nil
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||

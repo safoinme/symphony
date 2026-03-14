@@ -20,7 +20,7 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host, issue_context),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
@@ -31,21 +31,23 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
-    cond do
-      File.dir?(workspace) ->
-        {:ok, workspace, false}
+  defp ensure_workspace(workspace, nil, issue_context) do
+    case Config.settings!().workspace.strategy do
+      "worktree" ->
+        case resolve_base_repo(issue_context) do
+          {:ok, base_repo} ->
+            ensure_worktree(workspace, base_repo)
 
-      File.exists?(workspace) ->
-        File.rm_rf!(workspace)
-        create_workspace(workspace)
+          {:error, _reason} = error ->
+            error
+        end
 
-      true ->
-        create_workspace(workspace)
+      _ ->
+        ensure_directory(workspace)
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, worker_host, _issue_context) when is_binary(worker_host) do
     script =
       [
         "set -eu",
@@ -84,6 +86,47 @@ defmodule SymphonyElixir.Workspace do
     {:ok, workspace, true}
   end
 
+  defp ensure_directory(workspace) do
+    cond do
+      File.dir?(workspace) ->
+        {:ok, workspace, false}
+
+      File.exists?(workspace) ->
+        File.rm_rf!(workspace)
+        create_workspace(workspace)
+
+      true ->
+        create_workspace(workspace)
+    end
+  end
+
+  defp ensure_worktree(workspace, base_repo) do
+    if File.dir?(workspace) do
+      {:ok, workspace, false}
+    else
+      branch = "agent/#{Path.basename(workspace)}"
+
+      case System.cmd("git", ["worktree", "add", workspace, "-b", branch, "origin/main"],
+             cd: base_repo, stderr_to_stdout: true) do
+        {_output, 0} ->
+          {:ok, workspace, true}
+
+        {output, _status} ->
+          if File.dir?(workspace) do
+            {:ok, workspace, false}
+          else
+            {:error, {:worktree_failed, output}}
+          end
+      end
+    end
+  end
+
+  @spec workspace_path(String.t()) :: {:ok, Path.t()} | {:error, term()}
+  def workspace_path(identifier) when is_binary(identifier) do
+    safe_id = safe_identifier(identifier)
+    workspace_path_for_issue(safe_id, nil)
+  end
+
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
 
@@ -94,7 +137,7 @@ defmodule SymphonyElixir.Workspace do
         case validate_workspace_path(workspace, nil) do
           :ok ->
             maybe_run_before_remove_hook(workspace, nil)
-            File.rm_rf(workspace)
+            remove_workspace_by_strategy(workspace)
 
           {:error, reason} ->
             {:error, reason, ""}
@@ -125,6 +168,22 @@ defmodule SymphonyElixir.Workspace do
       {:error, reason} ->
         {:error, reason, ""}
     end
+  end
+
+  defp remove_workspace_by_strategy(workspace) do
+    case Config.settings!().workspace.strategy do
+      "worktree" -> remove_worktree(workspace)
+      _ -> File.rm_rf(workspace)
+    end
+  end
+
+  defp remove_worktree(workspace) do
+    base_repo = discover_worktree_base_repo(workspace)
+
+    System.cmd("git", ["worktree", "remove", "--force", workspace],
+      cd: base_repo, stderr_to_stdout: true)
+
+    {:ok, []}
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
@@ -161,6 +220,21 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host) do
     :ok
+  end
+
+  @spec run_before_plan_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+          :ok | {:error, term()}
+  def run_before_plan_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+    issue_ctx = issue_context(issue_or_identifier)
+    hooks = Config.settings!().hooks
+
+    case hooks.before_plan do
+      nil ->
+        :ok
+
+      command ->
+        run_hook(command, workspace, issue_ctx, "before_plan", worker_host)
+    end
   end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
@@ -456,10 +530,75 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp resolve_base_repo(issue_context) do
+    workspace_config = Config.settings!().workspace
+    projects = workspace_config.projects || %{}
+    repo_map = workspace_config.repo_map || %{}
+    project_name = Map.get(issue_context, :project_name)
+
+    # 1. Match project name against workspace.projects (primary)
+    matched_repo =
+      match_repo_by_projects_map(projects, project_name) ||
+        # 2. Fallback: match against workspace.repo_map
+        match_repo_by_project(repo_map, project_name) ||
+        match_repo_by_labels(repo_map, Map.get(issue_context, :labels, []))
+
+    cond do
+      matched_repo != nil ->
+        {:ok, matched_repo}
+
+      # 3. Last resort: worktree_base_repo
+      workspace_config.worktree_base_repo != nil ->
+        {:ok, workspace_config.worktree_base_repo}
+
+      true ->
+        available_keys = Map.keys(projects) ++ Map.keys(repo_map)
+
+        Logger.error(
+          "No project match for issue #{issue_context.issue_identifier}. " <>
+            "Issue project: #{inspect(project_name)}, configured projects: #{inspect(available_keys)}. " <>
+            "Set the issue's project in Linear to match a workspace.projects key."
+        )
+
+        {:error, {:no_repo_map_match, issue_context.issue_identifier, project_name, available_keys}}
+    end
+  end
+
+  defp match_repo_by_projects_map(_projects, nil), do: nil
+
+  defp match_repo_by_projects_map(projects, project_name) do
+    case Map.get(projects, String.downcase(project_name)) do
+      %{"repo" => repo} when is_binary(repo) and repo != "" -> repo
+      _ -> nil
+    end
+  end
+
+  defp match_repo_by_project(_repo_map, nil), do: nil
+
+  defp match_repo_by_project(repo_map, project_name) do
+    Map.get(repo_map, String.downcase(project_name))
+  end
+
+  defp match_repo_by_labels(repo_map, labels) do
+    Enum.find_value(labels, fn label ->
+      label_name = if is_map(label), do: Map.get(label, :name, ""), else: to_string(label)
+      Map.get(repo_map, String.downcase(label_name))
+    end)
+  end
+
+  defp discover_worktree_base_repo(workspace) do
+    case System.cmd("git", ["-C", workspace, "rev-parse", "--git-common-dir"], stderr_to_stdout: true) do
+      {path, 0} -> path |> String.trim() |> Path.dirname()
+      _ -> Config.settings!().workspace.worktree_base_repo
+    end
+  end
+
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      labels: Map.get(issue, :labels, []),
+      project_name: Map.get(issue, :project_name)
     }
   end
 

@@ -88,15 +88,38 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    @valid_strategies ["directory", "worktree"]
+
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:strategy, :string, default: "directory")
+      field(:worktree_base_repo, :string)
+      field(:repo_map, :map, default: %{})
+      field(:projects, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :strategy, :worktree_base_repo, :repo_map, :projects], empty_values: [])
+      |> validate_inclusion(:strategy, @valid_strategies)
+      |> validate_worktree_base_repo()
+    end
+
+    defp validate_worktree_base_repo(changeset) do
+      strategy = get_field(changeset, :strategy)
+      base_repo = get_field(changeset, :worktree_base_repo)
+      repo_map = get_field(changeset, :repo_map) || %{}
+      projects = get_field(changeset, :projects) || %{}
+
+      has_repos? = map_size(repo_map) > 0 or map_size(projects) > 0
+
+      if strategy == "worktree" and not has_repos? and (is_nil(base_repo) or base_repo == "") do
+        add_error(changeset, :worktree_base_repo, "is required when strategy is \"worktree\" and no projects or repo_map configured")
+      else
+        changeset
+      end
     end
   end
 
@@ -199,6 +222,91 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Pipeline do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    @valid_actions ["agent", "plan", "gate", "review", "transition"]
+    @valid_backends ["codex", "claude_code"]
+
+    embedded_schema do
+      field(:default_backend, :string, default: "codex")
+      field(:state_actions, :map, default: %{})
+      field(:planning_prompt_file, :string)
+      field(:review_prompt_file, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:default_backend, :state_actions, :planning_prompt_file, :review_prompt_file],
+        empty_values: []
+      )
+      |> validate_inclusion(:default_backend, @valid_backends)
+      |> validate_state_actions()
+    end
+
+    defp validate_state_actions(changeset) do
+      validate_change(changeset, :state_actions, fn :state_actions, actions ->
+        Enum.flat_map(actions, fn {_state, config} ->
+          validate_state_action_entry(config)
+        end)
+      end)
+    end
+
+    defp validate_state_action_entry(config) when is_map(config) do
+      action_errors =
+        case Map.get(config, "action") do
+          nil -> [{:state_actions, "each state action must have an \"action\" field"}]
+          action when action in @valid_actions -> []
+          _ -> [{:state_actions, "action must be one of: #{Enum.join(@valid_actions, ", ")}"}]
+        end
+
+      backend_errors =
+        case Map.get(config, "backend") do
+          nil -> []
+          backend when backend in @valid_backends -> []
+          _ -> [{:state_actions, "backend must be one of: #{Enum.join(@valid_backends, ", ")}"}]
+        end
+
+      action_errors ++ backend_errors
+    end
+
+    defp validate_state_action_entry(_config) do
+      [{:state_actions, "state action entries must be maps"}]
+    end
+  end
+
+  defmodule ClaudeCode do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    embedded_schema do
+      field(:command, :string, default: "claude")
+      field(:permission_mode, :string, default: "bypassPermissions")
+      field(:allowed_tools, {:array, :string}, default: ["Read", "Write", "Edit", "Bash(git *)"])
+      field(:max_budget_usd, :float, default: 5.0)
+      field(:model, :string, default: "claude-sonnet-4-6")
+      field(:cmux_visibility, :boolean, default: false)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:command, :permission_mode, :allowed_tools, :max_budget_usd, :model, :cmux_visibility],
+        empty_values: []
+      )
+      |> validate_required([:command])
+      |> validate_number(:max_budget_usd, greater_than: 0)
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -207,6 +315,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:after_create, :string)
+      field(:before_plan, :string)
       field(:before_run, :string)
       field(:after_run, :string)
       field(:before_remove, :string)
@@ -216,7 +325,7 @@ defmodule SymphonyElixir.Config.Schema do
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:after_create, :before_run, :after_run, :before_remove, :timeout_ms], empty_values: [])
+      |> cast(attrs, [:after_create, :before_plan, :before_run, :after_run, :before_remove, :timeout_ms], empty_values: [])
       |> validate_number(:timeout_ms, greater_than: 0)
     end
   end
@@ -268,6 +377,8 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:pipeline, Pipeline, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude_code, ClaudeCode, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -360,6 +471,8 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:pipeline, with: &Pipeline.changeset/2)
+    |> cast_embed(:claude_code, with: &ClaudeCode.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -372,9 +485,14 @@ defmodule SymphonyElixir.Config.Schema do
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
+    expanded_projects = expand_projects(settings.workspace.projects)
+    merged_projects = merge_repo_map_into_projects(expanded_projects, settings.workspace.repo_map)
+
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces")),
+        repo_map: expand_repo_map(settings.workspace.repo_map),
+        projects: merged_projects
     }
 
     codex = %{
@@ -384,6 +502,76 @@ defmodule SymphonyElixir.Config.Schema do
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  end
+
+  defp expand_repo_map(nil), do: %{}
+
+  defp expand_repo_map(repo_map) when is_map(repo_map) do
+    Enum.reduce(repo_map, %{}, fn {key, path}, acc ->
+      Map.put(acc, String.downcase(to_string(key)), Path.expand(to_string(path)))
+    end)
+  end
+
+  defp expand_projects(nil), do: %{}
+
+  defp expand_projects(projects) when is_map(projects) do
+    Enum.reduce(projects, %{}, fn {key, value}, acc ->
+      normalized_key = String.downcase(to_string(key))
+
+      expanded_value =
+        case value do
+          %{} = project_map ->
+            case Map.get(project_map, "repo") do
+              nil -> project_map
+              repo -> Map.put(project_map, "repo", Path.expand(to_string(repo)))
+            end
+
+          _ ->
+            value
+        end
+
+      Map.put(acc, normalized_key, expanded_value)
+    end)
+  end
+
+  defp merge_repo_map_into_projects(projects, nil), do: projects
+
+  defp merge_repo_map_into_projects(projects, repo_map) when is_map(repo_map) do
+    Enum.reduce(repo_map, projects, fn {key, path}, acc ->
+      normalized_key = String.downcase(to_string(key))
+
+      if Map.has_key?(acc, normalized_key) do
+        acc
+      else
+        Map.put(acc, normalized_key, %{"repo" => Path.expand(to_string(path))})
+      end
+    end)
+  end
+
+  @doc false
+  @spec project_slugs(%__MODULE__{}) :: [String.t()]
+  def project_slugs(settings) do
+    projects = settings.workspace.projects || %{}
+
+    slugs =
+      projects
+      |> Map.values()
+      |> Enum.map(fn
+        %{"slug" => slug} when is_binary(slug) and slug != "" -> slug
+        _ -> nil
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    case slugs do
+      [] ->
+        case settings.tracker.project_slug do
+          nil -> []
+          slug -> [slug]
+        end
+
+      slugs ->
+        slugs
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do

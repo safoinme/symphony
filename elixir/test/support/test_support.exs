@@ -115,15 +115,25 @@ defmodule SymphonyElixir.TestSupport do
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
           hook_after_create: nil,
+          hook_before_plan: nil,
           hook_before_run: nil,
           hook_after_run: nil,
           hook_before_remove: nil,
           hook_timeout_ms: 60_000,
+          workspace_strategy: nil,
+          workspace_worktree_base_repo: nil,
+          workspace_repo_map: nil,
+          workspace_projects: nil,
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
           server_port: nil,
           server_host: nil,
+          pipeline_default_backend: nil,
+          pipeline_state_actions: nil,
+          claude_code_command: nil,
+          claude_code_model: nil,
+          claude_code_cmux_visibility: nil,
           prompt: @workflow_prompt
         ],
         overrides
@@ -152,10 +162,15 @@ defmodule SymphonyElixir.TestSupport do
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
+    hook_before_plan = Keyword.get(config, :hook_before_plan)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
     hook_before_remove = Keyword.get(config, :hook_before_remove)
     hook_timeout_ms = Keyword.get(config, :hook_timeout_ms)
+    workspace_strategy = Keyword.get(config, :workspace_strategy)
+    workspace_worktree_base_repo = Keyword.get(config, :workspace_worktree_base_repo)
+    workspace_repo_map = Keyword.get(config, :workspace_repo_map)
+    workspace_projects = Keyword.get(config, :workspace_projects)
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
@@ -176,8 +191,7 @@ defmodule SymphonyElixir.TestSupport do
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
-        "workspace:",
-        "  root: #{yaml_value(workspace_root)}",
+        workspace_yaml(workspace_root, workspace_strategy, workspace_worktree_base_repo, workspace_repo_map, workspace_projects),
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
@@ -192,9 +206,18 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
-        hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
+        hooks_yaml(hook_after_create, hook_before_plan, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
+        pipeline_yaml(
+          Keyword.get(config, :pipeline_default_backend),
+          Keyword.get(config, :pipeline_state_actions)
+        ),
+        claude_code_yaml(
+          Keyword.get(config, :claude_code_command),
+          Keyword.get(config, :claude_code_model),
+          Keyword.get(config, :claude_code_cmux_visibility)
+        ),
         "---",
         prompt
       ]
@@ -225,19 +248,66 @@ defmodule SymphonyElixir.TestSupport do
 
   defp yaml_value(value), do: yaml_value(to_string(value))
 
-  defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
+  defp hooks_yaml(nil, nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 
-  defp hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
+  defp hooks_yaml(hook_after_create, hook_before_plan, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
     [
       "hooks:",
       "  timeout_ms: #{yaml_value(timeout_ms)}",
       hook_entry("after_create", hook_after_create),
+      hook_entry("before_plan", hook_before_plan),
       hook_entry("before_run", hook_before_run),
       hook_entry("after_run", hook_after_run),
       hook_entry("before_remove", hook_before_remove)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
+  end
+
+  defp workspace_yaml(root, nil, nil, nil, nil) do
+    ["workspace:", "  root: #{yaml_value(root)}"] |> Enum.join("\n")
+  end
+
+  defp workspace_yaml(root, strategy, worktree_base_repo, repo_map, projects) do
+    [
+      "workspace:",
+      "  root: #{yaml_value(root)}",
+      strategy && "  strategy: #{yaml_value(strategy)}",
+      worktree_base_repo && "  worktree_base_repo: #{yaml_value(worktree_base_repo)}",
+      repo_map_yaml(repo_map),
+      projects_yaml(projects)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp repo_map_yaml(nil), do: nil
+  defp repo_map_yaml(map) when map == %{}, do: nil
+
+  defp repo_map_yaml(map) when is_map(map) do
+    entries =
+      Enum.map_join(map, "\n", fn {key, path} ->
+        "    #{key}: #{yaml_value(path)}"
+      end)
+
+    "  repo_map:\n" <> entries
+  end
+
+  defp projects_yaml(nil), do: nil
+  defp projects_yaml(map) when map == %{}, do: nil
+
+  defp projects_yaml(map) when is_map(map) do
+    entries =
+      Enum.map_join(map, "\n", fn {name, project_config} ->
+        lines =
+          Enum.map_join(project_config, "\n", fn {key, value} ->
+            "      #{key}: #{yaml_value(value)}"
+          end)
+
+        "    #{name}:\n#{lines}"
+      end)
+
+    "  projects:\n" <> entries
   end
 
   defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host)
@@ -274,6 +344,31 @@ defmodule SymphonyElixir.TestSupport do
       host && "  host: #{yaml_value(host)}"
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp pipeline_yaml(nil, nil), do: nil
+
+  defp pipeline_yaml(default_backend, state_actions) do
+    [
+      "pipeline:",
+      default_backend && "  default_backend: #{yaml_value(default_backend)}",
+      state_actions && "  state_actions: #{yaml_value(state_actions)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp claude_code_yaml(nil, nil, nil), do: nil
+
+  defp claude_code_yaml(command, model, cmux_visibility) do
+    [
+      "claude_code:",
+      command && "  command: #{yaml_value(command)}",
+      model && "  model: #{yaml_value(model)}",
+      cmux_visibility != nil && "  cmux_visibility: #{yaml_value(cmux_visibility)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

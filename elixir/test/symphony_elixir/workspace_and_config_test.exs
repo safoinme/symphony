@@ -1299,4 +1299,466 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
+  describe "workspace strategy config" do
+    test "defaults to directory strategy" do
+      {:ok, settings} = Schema.parse(%{})
+      assert settings.workspace.strategy == "directory"
+      assert settings.workspace.worktree_base_repo == nil
+    end
+
+    test "accepts directory strategy" do
+      {:ok, settings} = Schema.parse(%{"workspace" => %{"strategy" => "directory"}})
+      assert settings.workspace.strategy == "directory"
+    end
+
+    test "accepts worktree strategy with base_repo" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "worktree_base_repo" => "/tmp/base-repo"
+          }
+        })
+
+      assert settings.workspace.strategy == "worktree"
+      assert settings.workspace.worktree_base_repo == "/tmp/base-repo"
+    end
+
+    test "rejects worktree strategy without base_repo and empty repo_map" do
+      {:error, {:invalid_workflow_config, msg}} =
+        Schema.parse(%{
+          "workspace" => %{"strategy" => "worktree"}
+        })
+
+      assert msg =~ "worktree_base_repo"
+    end
+
+    test "accepts worktree strategy with repo_map and no base_repo" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "repo_map" => %{"seshat" => "/tmp/seshat"}
+          }
+        })
+
+      assert settings.workspace.strategy == "worktree"
+      assert settings.workspace.worktree_base_repo == nil
+      assert settings.workspace.repo_map == %{"seshat" => "/tmp/seshat"}
+    end
+
+    test "repo_map keys are normalized to lowercase" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "repo_map" => %{"Seshat" => "/tmp/seshat", "DMAGHI" => "/tmp/dmaghi"}
+          }
+        })
+
+      assert Map.keys(settings.workspace.repo_map) == ["dmaghi", "seshat"]
+    end
+
+    test "repo_map paths are expanded" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "repo_map" => %{"seshat" => "~/work/seshat"}
+          }
+        })
+
+      assert settings.workspace.repo_map["seshat"] == Path.expand("~/work/seshat")
+    end
+
+    test "repo_map defaults to empty map" do
+      {:ok, settings} = Schema.parse(%{})
+      assert settings.workspace.repo_map == %{}
+    end
+
+    test "rejects invalid strategy" do
+      {:error, {:invalid_workflow_config, msg}} =
+        Schema.parse(%{
+          "workspace" => %{"strategy" => "invalid"}
+        })
+
+      assert msg =~ "strategy"
+    end
+  end
+
+  describe "worktree with repo_map" do
+    setup do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-worktree-repomap-#{System.unique_integer([:positive])}"
+        )
+
+      repo_a = Path.join(test_root, "repo_a")
+      repo_b = Path.join(test_root, "repo_b")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      for repo <- [repo_a, repo_b] do
+        bare = repo <> ".bare"
+        File.mkdir_p!(bare)
+        System.cmd("git", ["-C", bare, "init", "--bare", "-b", "main"])
+
+        File.mkdir_p!(repo)
+        File.write!(Path.join(repo, "README.md"), "repo #{Path.basename(repo)}\n")
+        System.cmd("git", ["-C", repo, "init", "-b", "main"])
+        System.cmd("git", ["-C", repo, "config", "user.name", "Test User"])
+        System.cmd("git", ["-C", repo, "config", "user.email", "test@example.com"])
+        System.cmd("git", ["-C", repo, "add", "."])
+        System.cmd("git", ["-C", repo, "commit", "-m", "initial"])
+        System.cmd("git", ["-C", repo, "remote", "add", "origin", bare])
+        System.cmd("git", ["-C", repo, "push", "-u", "origin", "main"])
+      end
+
+      on_exit(fn -> File.rm_rf(test_root) end)
+
+      %{
+        test_root: test_root,
+        repo_a: repo_a,
+        repo_b: repo_b,
+        workspace_root: workspace_root
+      }
+    end
+
+    test "issue with matching project uses correct base repo", %{repo_a: repo_a, repo_b: repo_b, workspace_root: workspace_root} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_repo_map: %{"alpha" => repo_a, "beta" => repo_b}
+      )
+
+      issue = %{
+        id: "issue-1",
+        identifier: "TEST-1",
+        project_name: "Alpha"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "README.md")) == "repo repo_a\n"
+    end
+
+    test "issue with no matching project falls back to worktree_base_repo", %{repo_a: repo_a, repo_b: repo_b, workspace_root: workspace_root} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_worktree_base_repo: repo_b,
+        workspace_repo_map: %{"alpha" => repo_a}
+      )
+
+      issue = %{
+        id: "issue-2",
+        identifier: "TEST-2",
+        project_name: "Unrelated"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "README.md")) == "repo repo_b\n"
+    end
+
+    test "repo_map project matching is case-insensitive", %{repo_a: repo_a, workspace_root: workspace_root} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_repo_map: %{"alpha" => repo_a}
+      )
+
+      issue = %{
+        id: "issue-3",
+        identifier: "TEST-3",
+        project_name: "ALPHA"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "README.md")) == "repo repo_a\n"
+    end
+
+    test "label-based fallback works when no project matches", %{repo_a: repo_a, workspace_root: workspace_root} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_repo_map: %{"alpha" => repo_a}
+      )
+
+      issue = %{
+        id: "issue-4",
+        identifier: "TEST-4",
+        project_name: nil,
+        labels: ["alpha"]
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "README.md")) == "repo repo_a\n"
+    end
+
+    test "returns error when no project or label matches and no fallback", %{workspace_root: workspace_root, repo_a: repo_a} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_repo_map: %{"alpha" => repo_a}
+      )
+
+      issue = %{
+        id: "issue-5",
+        identifier: "TEST-5",
+        project_name: "Unknown",
+        labels: ["unrelated"]
+      }
+
+      assert {:error, {:no_repo_map_match, "TEST-5", "Unknown", _keys}} =
+               Workspace.create_for_issue(issue)
+    end
+  end
+
+  describe "hooks before_plan config" do
+    test "before_plan hook parses correctly" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "hooks" => %{
+            "before_plan" => "rp-cli investigate --output .rp-context.json"
+          }
+        })
+
+      assert settings.hooks.before_plan == "rp-cli investigate --output .rp-context.json"
+    end
+
+    test "before_plan defaults to nil" do
+      {:ok, settings} = Schema.parse(%{})
+      assert settings.hooks.before_plan == nil
+    end
+  end
+
+  describe "workspace.projects config" do
+    test "projects parses correctly with slug and repo" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "seshat" => %{"slug" => "seshat-79c886f2b3ae", "repo" => "/tmp/seshat"},
+              "symphony" => %{"slug" => "symphony-abc123", "repo" => "/tmp/symphony"}
+            }
+          }
+        })
+
+      assert settings.workspace.projects["seshat"]["slug"] == "seshat-79c886f2b3ae"
+      assert settings.workspace.projects["seshat"]["repo"] == "/tmp/seshat"
+      assert settings.workspace.projects["symphony"]["slug"] == "symphony-abc123"
+    end
+
+    test "projects keys are normalized to lowercase" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "Seshat" => %{"slug" => "s1", "repo" => "/tmp/seshat"},
+              "SYMPHONY" => %{"slug" => "s2", "repo" => "/tmp/symphony"}
+            }
+          }
+        })
+
+      assert Map.keys(settings.workspace.projects) |> Enum.sort() == ["seshat", "symphony"]
+    end
+
+    test "projects paths are expanded" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "seshat" => %{"slug" => "s1", "repo" => "~/work/seshat"}
+            }
+          }
+        })
+
+      assert settings.workspace.projects["seshat"]["repo"] == Path.expand("~/work/seshat")
+    end
+
+    test "worktree with non-empty projects does not require worktree_base_repo" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "seshat" => %{"slug" => "s1", "repo" => "/tmp/seshat"}
+            }
+          }
+        })
+
+      assert settings.workspace.strategy == "worktree"
+      assert settings.workspace.worktree_base_repo == nil
+    end
+
+    test "repo_map entries are merged into projects without overriding" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "seshat" => %{"slug" => "s1", "repo" => "/tmp/seshat"}
+            },
+            "repo_map" => %{
+              "seshat" => "/tmp/seshat-old",
+              "dmaghi" => "/tmp/dmaghi"
+            }
+          }
+        })
+
+      # seshat from projects takes priority — not overridden by repo_map
+      assert settings.workspace.projects["seshat"]["slug"] == "s1"
+      assert settings.workspace.projects["seshat"]["repo"] == "/tmp/seshat"
+
+      # dmaghi from repo_map is merged in (no slug)
+      assert settings.workspace.projects["dmaghi"]["repo"] == Path.expand("/tmp/dmaghi")
+      refute Map.has_key?(settings.workspace.projects["dmaghi"], "slug")
+    end
+
+    test "projects defaults to empty map" do
+      {:ok, settings} = Schema.parse(%{})
+      assert settings.workspace.projects == %{}
+    end
+  end
+
+  describe "project_slugs/1" do
+    test "extracts slugs from workspace.projects" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "seshat" => %{"slug" => "seshat-79c886f2b3ae", "repo" => "/tmp/seshat"},
+              "symphony" => %{"slug" => "symphony-abc123", "repo" => "/tmp/symphony"}
+            }
+          }
+        })
+
+      slugs = Schema.project_slugs(settings) |> Enum.sort()
+      assert slugs == ["seshat-79c886f2b3ae", "symphony-abc123"]
+    end
+
+    test "falls back to tracker.project_slug when projects is empty" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "tracker" => %{"project_slug" => "legacy-slug"}
+        })
+
+      assert Schema.project_slugs(settings) == ["legacy-slug"]
+    end
+
+    test "returns empty list when no slugs configured" do
+      {:ok, settings} = Schema.parse(%{})
+      assert Schema.project_slugs(settings) == []
+    end
+
+    test "ignores projects without slug field" do
+      {:ok, settings} =
+        Schema.parse(%{
+          "workspace" => %{
+            "strategy" => "worktree",
+            "projects" => %{
+              "seshat" => %{"slug" => "seshat-slug", "repo" => "/tmp/seshat"},
+              "other" => %{"repo" => "/tmp/other"}
+            }
+          }
+        })
+
+      assert Schema.project_slugs(settings) == ["seshat-slug"]
+    end
+  end
+
+  describe "worktree with projects map" do
+    setup do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-worktree-projects-#{System.unique_integer([:positive])}"
+        )
+
+      repo_a = Path.join(test_root, "repo_a")
+      repo_b = Path.join(test_root, "repo_b")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      for repo <- [repo_a, repo_b] do
+        bare = repo <> ".bare"
+        File.mkdir_p!(bare)
+        System.cmd("git", ["-C", bare, "init", "--bare", "-b", "main"])
+
+        File.mkdir_p!(repo)
+        File.write!(Path.join(repo, "README.md"), "repo #{Path.basename(repo)}\n")
+        System.cmd("git", ["-C", repo, "init", "-b", "main"])
+        System.cmd("git", ["-C", repo, "config", "user.name", "Test User"])
+        System.cmd("git", ["-C", repo, "config", "user.email", "test@example.com"])
+        System.cmd("git", ["-C", repo, "add", "."])
+        System.cmd("git", ["-C", repo, "commit", "-m", "initial"])
+        System.cmd("git", ["-C", repo, "remote", "add", "origin", bare])
+        System.cmd("git", ["-C", repo, "push", "-u", "origin", "main"])
+      end
+
+      on_exit(fn -> File.rm_rf(test_root) end)
+
+      %{
+        test_root: test_root,
+        repo_a: repo_a,
+        repo_b: repo_b,
+        workspace_root: workspace_root
+      }
+    end
+
+    test "issue with matching project_name resolves repo from projects map", %{repo_a: repo_a, repo_b: repo_b, workspace_root: workspace_root} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_projects: %{
+          "alpha" => %{"slug" => "alpha-slug", "repo" => repo_a},
+          "beta" => %{"slug" => "beta-slug", "repo" => repo_b}
+        }
+      )
+
+      issue = %{
+        id: "issue-p1",
+        identifier: "PROJ-1",
+        project_name: "Alpha"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "README.md")) == "repo repo_a\n"
+    end
+
+    test "no match in projects map returns clear error", %{repo_a: repo_a, workspace_root: workspace_root} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "worktree",
+        workspace_projects: %{
+          "alpha" => %{"slug" => "alpha-slug", "repo" => repo_a}
+        }
+      )
+
+      issue = %{
+        id: "issue-p2",
+        identifier: "PROJ-2",
+        project_name: "Unknown",
+        labels: ["unrelated"]
+      }
+
+      assert {:error, {:no_repo_map_match, "PROJ-2", "Unknown", _keys}} =
+               Workspace.create_for_issue(issue)
+    end
+  end
+
+  describe "claude_code default model" do
+    test "default model is claude-sonnet-4-6" do
+      {:ok, settings} = Schema.parse(%{})
+      assert settings.claude_code.model == "claude-sonnet-4-6"
+    end
+  end
 end

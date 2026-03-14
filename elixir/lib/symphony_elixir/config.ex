@@ -91,6 +91,30 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec state_action(String.t()) :: map() | nil
+  def state_action(state_name) when is_binary(state_name) do
+    normalized = Schema.normalize_issue_state(state_name)
+
+    case settings!().pipeline.state_actions do
+      %{} = actions -> Map.get(actions, normalized)
+      _ -> nil
+    end
+  end
+
+  @spec agent_backend_module(String.t() | nil) :: module()
+  def agent_backend_module(backend_name \\ nil)
+
+  def agent_backend_module("claude_code"), do: SymphonyElixir.AgentBackend.ClaudeCode
+
+  def agent_backend_module(nil) do
+    case settings!().pipeline.default_backend do
+      "claude_code" -> SymphonyElixir.AgentBackend.ClaudeCode
+      _ -> SymphonyElixir.AgentBackend.Codex
+    end
+  end
+
+  def agent_backend_module(_), do: SymphonyElixir.AgentBackend.Codex
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     with {:ok, settings} <- settings() do
@@ -125,7 +149,7 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
+      settings.tracker.kind == "linear" and Schema.project_slugs(settings) == [] and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
 
       true ->

@@ -96,7 +96,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(_running, _retry), do: "running"
 
   defp running_entry_payload(entry) do
-    %{
+    base = %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       state: entry.state,
@@ -112,8 +112,20 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      branch_name: Map.get(entry, :branch_name),
+      backend_type: Map.get(entry, :backend_type),
+      action: Map.get(entry, :action)
     }
+
+    # Include cmux attach command when available
+    case Map.get(entry, :cmux_attach_cmd) do
+      cmd when is_binary(cmd) and cmd != "" ->
+        Map.put(base, :cmux_attach_cmd, cmd)
+
+      _ ->
+        base
+    end
   end
 
   defp retry_entry_payload(entry) do
@@ -143,7 +155,10 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
-      }
+      },
+      branch_name: Map.get(running, :branch_name),
+      backend_type: Map.get(running, :backend_type),
+      action: Map.get(running, :action)
     }
   end
 
