@@ -106,7 +106,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_agent_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, backend) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, workspace)
 
     run_turn_opts =
       [on_message: agent_message_handler(codex_update_recipient, issue)]
@@ -152,9 +152,12 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns, workspace) do
+    opts = maybe_inject_plan(opts, workspace)
+    PromptBuilder.build_prompt(issue, opts)
+  end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(_issue, _opts, turn_number, max_turns, _workspace) do
     """
     Continuation guidance:
 
@@ -169,10 +172,19 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
+        cond do
+          # State changed (e.g., agent moved it to "In Review") — stop, let orchestrator re-route
+          normalize_issue_state(refreshed_issue.state) != normalize_issue_state(issue.state) ->
+            Logger.info("Issue state changed from #{issue.state} to #{refreshed_issue.state} for #{issue_context(issue)}, stopping agent run")
+            {:done, refreshed_issue}
+
+          # Still in same state and it's active — continue
+          active_issue_state?(refreshed_issue.state) ->
+            {:continue, refreshed_issue}
+
+          # State is terminal
+          true ->
+            {:done, refreshed_issue}
         end
 
       {:ok, []} ->
@@ -226,6 +238,19 @@ defmodule SymphonyElixir.AgentRunner do
     state_name
     |> String.trim()
     |> String.downcase()
+  end
+
+  defp maybe_inject_plan(opts, workspace) do
+    plan_path = Path.join(workspace, "PLAN.md")
+
+    case File.read(plan_path) do
+      {:ok, content} when content != "" ->
+        Logger.info("Injecting PLAN.md into implementation prompt workspace=#{workspace}")
+        Keyword.put(opts, :implementation_plan, content)
+
+      _ ->
+        opts
+    end
   end
 
   defp maybe_put_opt(opts, _key, nil), do: opts

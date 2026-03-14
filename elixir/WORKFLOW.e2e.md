@@ -49,6 +49,20 @@ hooks:
     SYMPHONY_DIR="$(cd "$(dirname "$0")" && pwd)"
     sed -i '' "s|SYMPHONY_HOME|${SYMPHONY_DIR}|g" .mcp.json 2>/dev/null || true
     sed -i '' "s|LINEAR_API_KEY_VALUE|${LINEAR_API_KEY}|g" .mcp.json 2>/dev/null || true
+    # Generate a minimal CLAUDE.md from repo tree if none exists
+    if [ ! -f CLAUDE.md ] && [ ! -f .claude/CLAUDE.md ]; then
+      rp-cli -e 'tree' > .repo-tree.txt 2>/dev/null || true
+      if [ -f .repo-tree.txt ] && [ -s .repo-tree.txt ]; then
+        {
+          echo "# Repository Guide"
+          echo ""
+          echo "## File Structure"
+          echo ""
+          cat .repo-tree.txt
+        } > CLAUDE.md
+        rm .repo-tree.txt
+      fi
+    fi
   after_run: |
     echo "Turn completed for {{ issue.identifier }}"
   timeout_ms: 120000
@@ -104,31 +118,61 @@ claude_code:
   cmux_visibility: true
 ---
 
-You are working on a Linear issue.
+You are working on Linear issue `{{ issue.identifier }}`: {{ issue.title }}
+
+{% if attempt %}
+## Continuation context
+
+This is retry attempt #{{ attempt }}. The ticket is still in an active state.
+- Resume from the current workspace state instead of restarting from scratch.
+- Do not repeat already-completed investigation or validation.
+- Do not end the turn while the issue remains active unless you are blocked.
+{% endif %}
+
+## Issue
 
 Identifier: {{ issue.identifier }}
 Title: {{ issue.title }}
+Current status: {{ issue.state }}
 
-Body:
+Description:
 {% if issue.description %}
 {{ issue.description }}
 {% else %}
 No description provided.
 {% endif %}
+{% if implementation_plan %}
+
+## Implementation Plan (follow this)
+
+A planning agent has already investigated this issue and produced the following plan.
+Follow this plan. Do not re-investigate what has already been analyzed.
+
+{{ implementation_plan }}
+{% endif %}
 
 ## Instructions
 
-1. Read the issue carefully and understand the requirements.
-2. Explore the codebase to understand the existing architecture.
-3. Implement the changes following existing patterns and conventions.
-4. Write tests for your changes.
-5. When done, use the `linear_graphql` tool to:
-   - Post a comment summarizing what you did
-   - Move the issue to "In Review" state
+This is an unattended orchestration session. Never ask a human to perform follow-up actions.
+Only stop early for a true blocker (missing required auth/permissions/secrets).
+
+1. Start by reading CLAUDE.md (or AGENTS.md) if present — it's your map of the repo.
+2. If a plan is provided above, follow it. Otherwise, spend effort up front on planning before implementation.
+3. Create or update a single persistent Linear comment (`## Workpad`) to track progress:
+   - Hierarchical plan with checkboxes
+   - Acceptance criteria
+   - Validation results
+   - Keep it updated as you work
+4. Implement the changes following existing patterns and conventions.
+5. Write tests for your changes.
+6. Run tests and validation before considering work complete.
+7. Commit your changes with clear commit messages.
+8. When done, update the workpad comment with final status, then use `linear_graphql` to move the issue to "In Review".
 
 ## Guidelines
 
 - Follow existing code style and patterns
 - Keep changes minimal and focused
-- Write clear commit messages
 - Do not modify files unrelated to the issue
+- When out-of-scope improvements are found, note them in the workpad rather than expanding scope
+- If blocked, record the blocker in the workpad with what human action is needed to unblock

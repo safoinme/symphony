@@ -60,10 +60,12 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     config = build_config(opts)
+    session_id = restore_session_id(workspace)
 
     {:ok,
      %Session{
        workspace: workspace,
+       session_id: session_id,
        worker_host: worker_host,
        config: config
      }}
@@ -465,6 +467,7 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
     session_id = get_in(payload, ["session_id"]) || get_in(payload, ["sessionId"])
 
     if session_id do
+      persist_session_id(session.workspace, session_id)
       %{session | session_id: session_id}
     else
       session
@@ -545,6 +548,28 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
       # Fallback: try relative to the project root
       fallback = Path.join([File.cwd!(), "priv", "ndjson_display.py"])
       if File.exists?(fallback), do: fallback, else: nil
+    end
+  end
+
+  @session_id_file ".symphony-session-id"
+
+  defp persist_session_id(workspace, session_id) when is_binary(workspace) and is_binary(session_id) do
+    path = Path.join(workspace, @session_id_file)
+    File.write(path, session_id)
+    Logger.info("Persisted Claude Code session_id=#{session_id} to #{path}")
+  end
+
+  defp restore_session_id(workspace) when is_binary(workspace) do
+    path = Path.join(workspace, @session_id_file)
+
+    case File.read(path) do
+      {:ok, id} when id != "" ->
+        session_id = String.trim(id)
+        Logger.info("Restored Claude Code session_id=#{session_id} from #{path}")
+        session_id
+
+      _ ->
+        nil
     end
   end
 
