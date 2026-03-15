@@ -31,15 +31,22 @@ defmodule SymphonyElixir.PromptBuilder do
 
   Your task is to investigate the repository and produce a detailed implementation plan.
 
-  If you have access to RepoPrompt MCP tools (e.g. `context_builder`), use them to gather deeper
-  context about relevant files and modules before planning.
+  ## Step 1: Gather context (MANDATORY)
 
-  Steps:
-  1. Explore the codebase to understand the architecture and relevant modules.
-  2. Identify all files that will need to be created or modified.
-  3. Define a clear, step-by-step approach for implementing the change.
-  4. Flag any risks, edge cases, or areas of uncertainty.
-  5. Estimate the scope (small / medium / large) with justification.
+  Before planning, you MUST use the `context_builder` tool to gather focused repo context:
+  - Call `context_builder` with the issue title/description as the task
+  - This auto-selects relevant files and builds a codemap
+  - Also use `get_code_structure` on key directories to understand the architecture
+  - Use `get_file_tree` to see the overall repo structure
+
+  If `context_builder` is not available, fall back to Read/Grep/Glob to explore the codebase.
+
+  ## Step 2: Produce the plan
+
+  1. Identify all files that will need to be created or modified.
+  2. Define a clear, step-by-step approach for implementing the change.
+  3. Flag any risks, edge cases, or areas of uncertainty.
+  4. Estimate the scope (small / medium / large) with justification.
 
   If the issue description is too vague to produce a plan, output your questions under a
   "QUESTIONS" heading. Do NOT include "## Approach" or "## Affected Files" sections when
