@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.ImageDownloader, Linear.Issue, Plan, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -47,6 +47,7 @@ defmodule SymphonyElixir.AgentRunner do
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        ImageDownloader.download_for_issue(issue, workspace)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
@@ -153,7 +154,11 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns, workspace) do
-    opts = maybe_inject_plan(opts, workspace)
+    opts =
+      opts
+      |> maybe_inject_plan(workspace)
+      |> maybe_inject_handoff(workspace)
+
     PromptBuilder.build_prompt(issue, opts)
   end
 
@@ -241,12 +246,44 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp maybe_inject_plan(opts, workspace) do
-    plan_path = Path.join(workspace, "PLAN.md")
+    json_path = Path.join(workspace, "PLAN.json")
+    md_path = Path.join(workspace, "PLAN.md")
 
+    case File.read(json_path) do
+      {:ok, json} when json != "" ->
+        case Plan.from_json(json) do
+          {:ok, plan} ->
+            Logger.info("Injecting structured PLAN.json into implementation prompt workspace=#{workspace}")
+            checklist = Plan.to_checklist(plan)
+            Keyword.put(opts, :implementation_plan, checklist)
+
+          {:error, _} ->
+            inject_plan_md(opts, md_path, workspace)
+        end
+
+      _ ->
+        inject_plan_md(opts, md_path, workspace)
+    end
+  end
+
+  defp inject_plan_md(opts, plan_path, workspace) do
     case File.read(plan_path) do
       {:ok, content} when content != "" ->
         Logger.info("Injecting PLAN.md into implementation prompt workspace=#{workspace}")
         Keyword.put(opts, :implementation_plan, content)
+
+      _ ->
+        opts
+    end
+  end
+
+  defp maybe_inject_handoff(opts, workspace) do
+    handoff_path = Path.join(workspace, ".rp-handoff.md")
+
+    case File.read(handoff_path) do
+      {:ok, content} when content != "" ->
+        Logger.info("Injecting RepoPrompt handoff context into implementation prompt workspace=#{workspace}")
+        Keyword.put(opts, :handoff_context, content)
 
       _ ->
         opts

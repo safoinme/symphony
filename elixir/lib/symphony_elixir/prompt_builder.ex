@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, Linear.ImageDownloader, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -31,17 +31,34 @@ defmodule SymphonyElixir.PromptBuilder do
 
   Your task is to investigate the repository and produce a detailed implementation plan.
 
-  ## Step 1: Gather context (MANDATORY)
+  If the description references screenshots or images, they have been downloaded to the
+  `screenshots/` directory in your workspace. Use the Read tool to view them — they are
+  image files that you can see directly.
 
-  Before planning, you MUST use the `context_builder` tool to gather focused repo context:
-  - Call `context_builder` with the issue title/description as the task
-  - This auto-selects relevant files and builds a codemap
-  - Also use `get_code_structure` on key directories to understand the architecture
-  - Use `get_file_tree` to see the overall repo structure
+  ## Step 1: Gather context (MANDATORY — use RepoPrompt)
 
-  If `context_builder` is not available, fall back to Read/Grep/Glob to explore the codebase.
+  Call the `context_builder` MCP tool (from the RepoPrompt server) with the issue
+  title and description as the `task` parameter. This auto-selects relevant files,
+  builds codemaps, and returns focused codebase context — all in a single tool call.
 
-  ## Step 2: Produce the plan
+  If `context_builder` is not available, fall back to Read/Grep/Glob.
+
+  ## Step 2: Save handoff context
+
+  After receiving the `context_builder` output, save the codebase analysis (file
+  relationships, codemaps, and relevant code snippets) to `.rp-handoff.md` in your
+  workspace using the Write tool. This file will be passed to the implementation
+  agent so it does not need to re-explore the codebase.
+
+  Include in the handoff:
+  - Which files are relevant and how they relate to each other
+  - Key code patterns and conventions observed
+  - Any architectural context the implementer needs
+
+  ## Step 3: Produce the plan
+
+  **IMPORTANT: Output the plan as TEXT in your response. Do NOT write it to a file.**
+  The orchestration system will automatically save it and post a summary to Linear.
 
   1. Identify all files that will need to be created or modified.
   2. Define a clear, step-by-step approach for implementing the change.
@@ -52,7 +69,26 @@ defmodule SymphonyElixir.PromptBuilder do
   "QUESTIONS" heading. Do NOT include "## Approach" or "## Affected Files" sections when
   asking questions — only include those when you have a complete plan.
 
-  When you have enough information, output a structured Markdown plan with these sections:
+  When you have enough information, output a structured plan as a JSON code block with this format:
+
+  ```json
+  {
+    "scope": "small | medium | large",
+    "approach": "High-level description of the implementation approach",
+    "tasks": [
+      {
+        "id": "t1",
+        "description": "Description of the task",
+        "file_paths": ["path/to/file.ex"],
+        "status": "pending"
+      }
+    ],
+    "affected_files": ["path/to/file.ex"],
+    "risks": ["Description of risk or edge case"]
+  }
+  ```
+
+  If JSON output is not possible, fall back to a structured Markdown plan with these sections:
   - **## Affected Files** — list of files to create or modify
   - **## Approach** — step-by-step implementation plan
   - **## Risks** — edge cases and areas of uncertainty
@@ -68,13 +104,30 @@ defmodule SymphonyElixir.PromptBuilder do
   {{ diff }}
   ```
 
-  Evaluate the changes against these criteria:
-  1. **Correctness**: Does the code do what the issue requires? Are there logic errors?
-  2. **Code Quality**: Is the code readable, well-structured, and following project conventions?
-  3. **Test Coverage**: Are there adequate tests for the changes?
-  4. **Security**: Are there any security concerns (injection, auth bypass, data leaks)?
+  Evaluate the changes against these dimensions:
+  1. **correctness**: Does the code do what the issue requires? Are there logic errors?
+  2. **code_quality**: Is the code readable, well-structured, and following project conventions?
+  3. **test_coverage**: Are there adequate tests for the changes?
+  4. **security**: Are there any security concerns (injection, auth bypass, data leaks)?
+  5. **plan_adherence**: Does the implementation match the plan (if one was provided)?
 
-  End your review with exactly one of these verdicts on its own line:
+  Provide your review as a JSON code block:
+
+  ```json
+  {
+    "overall_verdict": "approved | changes_requested",
+    "dimensions": [
+      {
+        "name": "correctness",
+        "verdict": "pass | fail",
+        "feedback": "Optional feedback explaining the verdict",
+        "severity": "critical | high | medium | low"
+      }
+    ]
+  }
+  ```
+
+  If JSON output is not possible, end your review with exactly one of these verdicts on its own line:
   - APPROVED (if the changes are ready to merge)
   - CHANGES_REQUESTED (if issues need to be addressed)
   """
@@ -90,8 +143,9 @@ defmodule SymphonyElixir.PromptBuilder do
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map(),
-        "implementation_plan" => Keyword.get(opts, :implementation_plan)
+        "issue" => issue |> rewrite_issue_images() |> Map.from_struct() |> to_solid_map(),
+        "implementation_plan" => Keyword.get(opts, :implementation_plan),
+        "handoff_context" => Keyword.get(opts, :handoff_context)
       },
       @render_opts
     )
@@ -134,7 +188,7 @@ defmodule SymphonyElixir.PromptBuilder do
     template_text = planning_prompt_template()
 
     context = %{
-      "issue" => issue |> Map.from_struct() |> to_solid_map(),
+      "issue" => issue |> rewrite_issue_images() |> Map.from_struct() |> to_solid_map(),
       "rp_context" => rp_context,
       "human_replies" => human_replies
     }
@@ -182,6 +236,12 @@ defmodule SymphonyElixir.PromptBuilder do
       {:error, reason} -> raise RuntimeError, "Failed to read template file #{path}: #{inspect(reason)}"
     end
   end
+
+  defp rewrite_issue_images(%{description: description} = issue) do
+    %{issue | description: ImageDownloader.rewrite_image_refs(description)}
+  end
+
+  defp rewrite_issue_images(issue), do: issue
 
   defp default_prompt(prompt) when is_binary(prompt) do
     if String.trim(prompt) == "" do

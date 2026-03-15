@@ -82,7 +82,6 @@ pipeline:
     "todo":
       action: plan
       backend: claude_code
-      max_turns: 5
     "in progress":
       action: agent
       backend: claude_code
@@ -140,6 +139,15 @@ Description:
 {{ issue.description }}
 {% else %}
 No description provided.
+{% endif %}
+{% if handoff_context %}
+
+## Codebase Context (from planning phase)
+
+The planning agent analyzed the codebase and produced the following context.
+Use this to understand file relationships and patterns. Do not re-explore these files.
+
+{{ handoff_context }}
 {% endif %}
 {% if implementation_plan %}
 

@@ -117,6 +117,22 @@ defmodule SymphonyElixir.PlanningRunnerTest do
     end
 
     test "sends worker runtime info to recipient" do
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-plan-runtime-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        pipeline_state_actions: %{
+          "todo" => %{"action" => "plan"}
+        }
+      )
+
       issue = test_issue()
       recipient = self()
 
@@ -126,6 +142,8 @@ defmodule SymphonyElixir.PlanningRunnerTest do
       )
 
       assert_received {:worker_runtime_info, "issue-plan-1", %{workspace_path: _}}
+
+      File.rm_rf(workspace_root)
     end
 
     test "extracts plan from Claude Code response format" do
@@ -182,6 +200,22 @@ defmodule SymphonyElixir.PlanningRunnerTest do
     end
 
     test "handles start_session failure" do
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-plan-session-fail-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        pipeline_state_actions: %{
+          "todo" => %{"action" => "plan"}
+        }
+      )
+
       issue = test_issue()
       AgentBackend.Stub.configure(:start_session, {:error, :session_failed})
 
@@ -190,6 +224,8 @@ defmodule SymphonyElixir.PlanningRunnerTest do
                  backend: AgentBackend.Stub,
                  issue_state_fetcher: fn _ids -> {:ok, [issue]} end
                )
+
+      File.rm_rf(workspace_root)
     end
 
     test "runs before_plan hook before agent turn" do
@@ -256,6 +292,22 @@ defmodule SymphonyElixir.PlanningRunnerTest do
     end
 
     test "gracefully skips missing .rp-context.json" do
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-plan-no-rp-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        pipeline_state_actions: %{
+          "todo" => %{"action" => "plan"}
+        }
+      )
+
       issue = test_issue()
 
       AgentBackend.Stub.configure(:run_turn, {:ok, %{text: "## Affected Files\n\n- foo.ex\n\n## Approach\n\nDo the thing."}})
@@ -267,6 +319,8 @@ defmodule SymphonyElixir.PlanningRunnerTest do
 
       [{_session, prompt, _issue, _opts}] = AgentBackend.Stub.calls(:run_turn)
       refute prompt =~ "Repository Analysis"
+
+      File.rm_rf(workspace_root)
     end
   end
 

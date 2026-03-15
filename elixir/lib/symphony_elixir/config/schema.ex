@@ -142,6 +142,26 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule CircuitBreakerConfig do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:failure_threshold, :integer, default: 5)
+      field(:reset_timeout_ms, :integer, default: 60_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:failure_threshold, :reset_timeout_ms], empty_values: [])
+      |> validate_number(:failure_threshold, greater_than: 0)
+      |> validate_number(:reset_timeout_ms, greater_than: 0)
+    end
+  end
+
   defmodule Agent do
     @moduledoc false
     use Ecto.Schema
@@ -155,6 +175,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      embeds_one(:circuit_breaker, Schema.CircuitBreakerConfig, on_replace: :update, defaults_to_struct: true)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -165,6 +186,7 @@ defmodule SymphonyElixir.Config.Schema do
         [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
         empty_values: []
       )
+      |> cast_embed(:circuit_breaker, with: &Schema.CircuitBreakerConfig.changeset/2)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
@@ -237,14 +259,14 @@ defmodule SymphonyElixir.Config.Schema do
       field(:state_actions, :map, default: %{})
       field(:planning_prompt_file, :string)
       field(:review_prompt_file, :string)
+      field(:max_review_iterations, :integer, default: 3)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:default_backend, :state_actions, :planning_prompt_file, :review_prompt_file],
-        empty_values: []
-      )
+      |> cast(attrs, [:default_backend, :state_actions, :planning_prompt_file, :review_prompt_file, :max_review_iterations], empty_values: [])
+      |> validate_number(:max_review_iterations, greater_than: 0)
       |> validate_inclusion(:default_backend, @valid_backends)
       |> validate_state_actions()
     end
@@ -299,9 +321,7 @@ defmodule SymphonyElixir.Config.Schema do
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:command, :permission_mode, :allowed_tools, :max_budget_usd, :model, :cmux_visibility],
-        empty_values: []
-      )
+      |> cast(attrs, [:command, :permission_mode, :allowed_tools, :max_budget_usd, :model, :cmux_visibility], empty_values: [])
       |> validate_required([:command])
       |> validate_number(:max_budget_usd, greater_than: 0)
     end
@@ -316,8 +336,11 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:after_create, :string)
       field(:before_plan, :string)
+      field(:after_plan, :string)
       field(:before_run, :string)
       field(:after_run, :string)
+      field(:before_review, :string)
+      field(:after_review, :string)
       field(:before_remove, :string)
       field(:timeout_ms, :integer, default: 60_000)
     end
@@ -325,7 +348,21 @@ defmodule SymphonyElixir.Config.Schema do
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:after_create, :before_plan, :before_run, :after_run, :before_remove, :timeout_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :after_create,
+          :before_plan,
+          :after_plan,
+          :before_run,
+          :after_run,
+          :before_review,
+          :after_review,
+          :before_remove,
+          :timeout_ms
+        ],
+        empty_values: []
+      )
       |> validate_number(:timeout_ms, greater_than: 0)
     end
   end
@@ -370,6 +407,24 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule KnowledgeBase do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:path, :string, default: "docs/exec-plans")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :path], empty_values: [])
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -382,6 +437,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:knowledge_base, KnowledgeBase, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -476,6 +532,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:knowledge_base, with: &KnowledgeBase.changeset/2)
   end
 
   defp finalize_settings(settings) do

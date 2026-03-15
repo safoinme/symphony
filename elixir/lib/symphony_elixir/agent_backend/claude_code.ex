@@ -81,9 +81,7 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
 
     args = build_cli_args(session, prompt, max_turns, model)
 
-    Logger.info(
-      "Claude Code starting turn for #{issue_context(issue)} workspace=#{session.workspace}"
-    )
+    Logger.info("Claude Code starting turn for #{issue_context(issue)} workspace=#{session.workspace}")
 
     result =
       if use_cmux?(session.config) do
@@ -178,17 +176,15 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
     output_path = Path.join(session.workspace, ".symphony-output.ndjson")
     signal_name = "symphony-#{sanitize_for_signal(issue)}-#{:erlang.unique_integer([:positive])}"
     issue_label = cmux_tab_label(issue)
+    project_name = cmux_project_name(issue)
 
     executable = resolve_executable(session.config.command)
 
     case executable do
       {:ok, path} ->
-        # Build the shell command that runs in the cmux pane
         cli_args_str = Enum.map_join(args, " ", &shell_escape/1)
         display_filter = ndjson_display_filter_path()
 
-        # Use unbuffered display filter instead of tee to avoid macOS tee buffering
-        # which prevents the streaming parser from reading events from the file.
         tee_cmd =
           if display_filter do
             "python3 #{shell_escape(display_filter)} #{shell_escape(output_path)}"
@@ -196,44 +192,112 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
             "tee #{shell_escape(output_path)}"
           end
 
-        wrapper_script = """
-        printf '\\033]0;#{issue_label}\\007'
-        cd #{shell_escape(session.workspace)} && \
-        #{shell_escape(path)} #{cli_args_str} 2>&1 | #{tee_cmd}
-        EXIT_CODE=${PIPESTATUS[0]:-$?}
-        echo ""
-        echo "━━━ Agent finished (exit $EXIT_CODE) ━━━"
-        cmux wait-for -S #{signal_name}
-        """
+        cmd_ctx = %{
+          issue_label: issue_label,
+          tee_cmd: tee_cmd,
+          cli_path: path,
+          cli_args_str: cli_args_str,
+          signal_name: signal_name,
+          workspace: session.workspace
+        }
 
-        Logger.info("Opening cmux workspace for #{issue_label}")
-
-        case Cmux.new_workspace(wrapper_script) do
-          {:ok, workspace_ref} ->
-            Logger.info("cmux workspace created: #{workspace_ref} for #{issue_label}")
-            Cmux.rename_workspace(workspace_ref, issue_label)
-
-            # Emit workspace ref so the orchestrator can expose it in the dashboard
+        case open_cmux_surface(project_name, cmd_ctx) do
+          {:ok, placement} ->
             emit_event(on_message, :cmux_workspace, %{
-              "cmux_workspace_ref" => workspace_ref,
-              "cmux_attach_cmd" => "cmux select-workspace #{workspace_ref}"
+              "cmux_workspace_ref" => placement.workspace_ref,
+              "cmux_attach_cmd" => "cmux select-workspace #{placement.workspace_ref}"
             })
 
             try do
               wait_and_stream_cmux(signal_name, output_path, session, on_message)
             after
-              Logger.info("Closing cmux workspace #{workspace_ref} for #{issue_label}")
-              Cmux.close_workspace(workspace_ref)
+              Logger.info("Closing cmux surface for #{issue_label}")
+              close_cmux_surface(placement)
             end
 
           {:error, reason} ->
-            Logger.warning("cmux workspace creation failed, falling back to Port: #{inspect(reason)}")
+            Logger.warning("cmux surface creation failed, falling back to Port: #{inspect(reason)}")
             spawn_and_collect_port(session, args, on_message, issue)
         end
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Opens a cmux surface for an agent. If a workspace already exists for the
+  # project, creates a new tab (surface) inside it. Otherwise creates a new workspace.
+  defp open_cmux_surface(project_name, cmd_ctx) do
+    existing_workspace = if project_name, do: Cmux.find_workspace_by_title(project_name), else: :not_found
+
+    case existing_workspace do
+      {:ok, workspace_ref} ->
+        Logger.info("Reusing cmux workspace #{workspace_ref} (#{project_name}) for #{cmd_ctx.issue_label}")
+        open_surface_in_workspace(workspace_ref, project_name, cmd_ctx)
+
+      _ ->
+        open_new_workspace(project_name, cmd_ctx)
+    end
+  end
+
+  defp open_surface_in_workspace(workspace_ref, project_name, cmd_ctx) do
+    case Cmux.new_surface(workspace: workspace_ref) do
+      {:ok, surface_ref} ->
+        Logger.info("Created cmux surface #{surface_ref} in workspace #{workspace_ref} for #{cmd_ctx.issue_label}")
+        Cmux.rename_tab(cmd_ctx.issue_label, workspace: workspace_ref, surface: surface_ref)
+
+        command = build_agent_shell_command(cmd_ctx)
+        Cmux.send_to_surface(command <> "\n", workspace: workspace_ref, surface: surface_ref)
+
+        {:ok, %{workspace_ref: workspace_ref, surface_ref: surface_ref, owns_workspace: false}}
+
+      {:error, reason} ->
+        Logger.warning("Failed to create surface in workspace #{workspace_ref}: #{inspect(reason)}, creating new workspace")
+        open_new_workspace(project_name, cmd_ctx)
+    end
+  end
+
+  defp open_new_workspace(project_name, cmd_ctx) do
+    wrapper_script = build_agent_shell_command(cmd_ctx)
+    workspace_title = project_name || cmd_ctx.issue_label
+
+    Logger.info("Opening new cmux workspace for #{workspace_title}")
+
+    case Cmux.new_workspace(wrapper_script) do
+      {:ok, workspace_ref} ->
+        Logger.info("cmux workspace created: #{workspace_ref} for #{workspace_title}")
+        Cmux.rename_workspace(workspace_ref, workspace_title)
+        {:ok, %{workspace_ref: workspace_ref, surface_ref: nil, owns_workspace: true}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp build_agent_shell_command(cmd_ctx) do
+    """
+    printf '\\033]0;#{cmd_ctx.issue_label}\\007'
+    cd #{shell_escape(cmd_ctx.workspace)} && \
+    #{shell_escape(cmd_ctx.cli_path)} #{cmd_ctx.cli_args_str} 2>&1 | #{cmd_ctx.tee_cmd}
+    EXIT_CODE=${PIPESTATUS[0]:-$?}
+    echo ""
+    echo "━━━ Agent finished (exit $EXIT_CODE) ━━━"
+    cmux wait-for -S #{cmd_ctx.signal_name}
+    """
+  end
+
+  defp close_cmux_surface(%{owns_workspace: true, workspace_ref: ref}) do
+    Cmux.close_workspace(ref)
+  end
+
+  defp close_cmux_surface(%{surface_ref: surface_ref, workspace_ref: workspace_ref}) when is_binary(surface_ref) do
+    Cmux.close_surface(workspace: workspace_ref, surface: surface_ref)
+  end
+
+  defp close_cmux_surface(_placement), do: :ok
+
+  defp cmux_project_name(issue) do
+    Map.get(issue, :project_name) || Map.get(issue, "project_name")
   end
 
   defp wait_and_stream_cmux(signal_name, output_path, session, on_message) do
@@ -504,7 +568,9 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode do
 
   defp safe_close_port(port) do
     case :erlang.port_info(port) do
-      :undefined -> :ok
+      :undefined ->
+        :ok
+
       _ ->
         try do
           Port.close(port)

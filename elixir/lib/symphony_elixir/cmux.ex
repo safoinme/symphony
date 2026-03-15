@@ -66,6 +66,104 @@ defmodule SymphonyElixir.Cmux do
     end
   end
 
+  @spec list_workspaces() :: {:ok, [map()]} | {:error, term()}
+  def list_workspaces do
+    case run_cmux(["--json", "list-workspaces"]) do
+      {:ok, output} ->
+        case Jason.decode(output) do
+          {:ok, %{"workspaces" => workspaces}} when is_list(workspaces) ->
+            {:ok, workspaces}
+
+          {:ok, _} ->
+            {:ok, []}
+
+          {:error, _} ->
+            {:ok, []}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec find_workspace_by_title(String.t()) :: {:ok, String.t()} | :not_found | {:error, term()}
+  def find_workspace_by_title(title) when is_binary(title) do
+    downcased = String.downcase(title)
+
+    case list_workspaces() do
+      {:ok, workspaces} ->
+        case Enum.find(workspaces, fn ws ->
+               ws_title = Map.get(ws, "title", "")
+               String.downcase(ws_title) == downcased
+             end) do
+          %{"ref" => ref} -> {:ok, ref}
+          nil -> :not_found
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec new_surface(keyword()) :: {:ok, String.t()} | {:error, term()}
+  def new_surface(opts \\ []) do
+    args =
+      ["--json", "new-surface"]
+      |> maybe_add("--workspace", Keyword.get(opts, :workspace))
+      |> maybe_add("--pane", Keyword.get(opts, :pane))
+
+    case run_cmux(args) do
+      {:ok, output} ->
+        case Jason.decode(output) do
+          {:ok, %{"surface_ref" => ref}} -> {:ok, ref}
+          {:ok, %{"ref" => ref}} -> {:ok, ref}
+          _ -> {:ok, String.trim(output)}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec rename_tab(String.t(), keyword()) :: :ok | {:error, term()}
+  def rename_tab(title, opts \\ []) do
+    args =
+      ["rename-tab"]
+      |> maybe_add("--workspace", Keyword.get(opts, :workspace))
+      |> maybe_add("--surface", Keyword.get(opts, :surface))
+
+    case run_cmux(args ++ [title]) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec send_to_surface(String.t(), keyword()) :: :ok | {:error, term()}
+  def send_to_surface(text, opts \\ []) do
+    args =
+      ["send"]
+      |> maybe_add("--workspace", Keyword.get(opts, :workspace))
+      |> maybe_add("--surface", Keyword.get(opts, :surface))
+
+    case run_cmux(args ++ [text]) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec close_surface(keyword()) :: :ok | {:error, term()}
+  def close_surface(opts \\ []) do
+    args =
+      ["close-surface"]
+      |> maybe_add("--workspace", Keyword.get(opts, :workspace))
+      |> maybe_add("--surface", Keyword.get(opts, :surface))
+
+    case run_cmux(args) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec capture_pane(keyword()) :: {:ok, String.t()} | {:error, term()}
   def capture_pane(opts \\ []) do
     args =
@@ -111,19 +209,15 @@ defmodule SymphonyElixir.Cmux do
   defp parse_workspace_ref(output) do
     trimmed = String.trim(output)
 
-    cond do
-      # Match "workspace:N" format
-      match?([_], Regex.run(~r/workspace:\d+/, trimmed)) ->
-        [ref] = Regex.run(~r/workspace:\d+/, trimmed)
+    case Regex.run(~r/workspace:\d+/, trimmed) do
+      [ref] ->
         {:ok, ref}
 
-      # Match "OK <UUID>" format from new-workspace
-      match?([_, _], Regex.run(~r/^OK\s+([0-9A-Fa-f-]{36})/, trimmed)) ->
-        [_, uuid] = Regex.run(~r/^OK\s+([0-9A-Fa-f-]{36})/, trimmed)
-        {:ok, uuid}
-
-      true ->
-        :error
+      nil ->
+        case Regex.run(~r/^OK\s+([0-9A-Fa-f-]{36})/, trimmed) do
+          [_, uuid] -> {:ok, uuid}
+          nil -> :error
+        end
     end
   end
 

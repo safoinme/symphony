@@ -1,17 +1,17 @@
 defmodule SymphonyElixir.ReviewRunner do
   @moduledoc """
   Executes an automated review of completed work for a Linear issue.
-  Gathers the diff, runs a review agent, and transitions the issue
-  based on the review verdict.
+  Supports multi-dimensional review with iteration loops: if the review
+  requests changes and max_iterations hasn't been reached, the implementing
+  agent is re-run with feedback before re-review.
   """
 
   require Logger
-  alias SymphonyElixir.{Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, KnowledgeBase, Linear.Issue, Plan, PromptBuilder, ReviewResult, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
-  @approved_signals ["APPROVED", "LGTM", "APPROVE"]
-  @rejected_signals ["CHANGES_REQUESTED", "REQUEST_CHANGES", "REJECT"]
+  @default_max_review_iterations 3
 
   @spec run(Issue.t(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, update_recipient \\ nil, opts \\ []) do
@@ -25,7 +25,8 @@ defmodule SymphonyElixir.ReviewRunner do
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_review_turn(workspace, issue, update_recipient, opts, worker_host)
+            max_iterations = max_review_iterations()
+            run_review_loop(workspace, issue, update_recipient, opts, worker_host, 1, max_iterations)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -41,17 +42,33 @@ defmodule SymphonyElixir.ReviewRunner do
     Workspace.create_for_issue(issue, worker_host)
   end
 
-  defp run_review_turn(workspace, issue, update_recipient, opts, worker_host) do
+  defp run_review_loop(workspace, issue, update_recipient, opts, worker_host, iteration, max_iterations) do
     backend = Keyword.get(opts, :backend, SymphonyElixir.AgentBackend.Codex)
+
+    # Run before_review hook — if it fails, inject the failure output into context
+    hook_context =
+      case Workspace.run_before_review_hook(workspace, issue, worker_host) do
+        {:ok, output} when output != "" ->
+          "\n\n## Pre-review check output\n```\n#{output}\n```\n"
+
+        {:error, {:workspace_hook_failed, _, _, output}} ->
+          "\n\n## Pre-review check FAILED\n```\n#{output}\n```\nAddress the failures above in your review.\n"
+
+        _ ->
+          ""
+      end
 
     case gather_diff(workspace, worker_host) do
       {:ok, diff} ->
-        prompt = PromptBuilder.build_review_prompt(issue, Keyword.put(opts, :diff, diff))
+        review_opts = Keyword.put(opts, :diff, diff <> hook_context)
+        prompt = PromptBuilder.build_review_prompt(issue, review_opts)
 
         with {:ok, session} <- backend.start_session(workspace, worker_host: worker_host) do
           try do
             result = run_single_turn(backend, session, prompt, issue, update_recipient, opts)
-            handle_review_result(result, issue)
+            review_result = handle_review_result(result, issue, workspace, iteration, max_iterations)
+            Workspace.run_after_review_hook(workspace, issue, worker_host)
+            review_result
           after
             backend.stop_session(session)
           end
@@ -97,26 +114,35 @@ defmodule SymphonyElixir.ReviewRunner do
     end
   end
 
-  defp handle_review_result({:ok, response}, issue) do
+  defp handle_review_result({:ok, response}, issue, workspace, iteration, max_iterations) do
     review_text = extract_review_text(response)
-    verdict = parse_verdict(review_text)
+    result = ReviewResult.parse(review_text)
+    result = %{result | iteration: iteration, max_iterations: max_iterations}
 
-    case verdict do
-      :approved ->
-        Logger.info("Review APPROVED for #{issue_context(issue)}")
+    if ReviewResult.approved?(result) do
+      Logger.info("Review APPROVED for #{issue_context(issue)} (iteration #{iteration}/#{max_iterations})")
+      maybe_archive_plan(issue, workspace)
 
-        case Tracker.update_issue_state(issue.id, "Done") do
-          :ok -> :ok
-          {:error, reason} -> {:error, {:state_transition_failed, reason}}
-        end
+      case Tracker.update_issue_state(issue.id, "Done") do
+        :ok -> :ok
+        {:error, reason} -> {:error, {:state_transition_failed, reason}}
+      end
+    else
+      Logger.info("Review CHANGES_REQUESTED for #{issue_context(issue)} (iteration #{iteration}/#{max_iterations})")
+      feedback = ReviewResult.format_feedback(result)
 
-      :changes_requested ->
-        Logger.info("Review CHANGES_REQUESTED for #{issue_context(issue)}")
+      if iteration < max_iterations do
+        Logger.info("Posting dimensional feedback for #{issue_context(issue)}, will re-dispatch for rework")
+        post_feedback_comment(issue, feedback)
         post_feedback_and_rework(issue, review_text)
+      else
+        Logger.info("Max review iterations reached for #{issue_context(issue)}, forcing Fix/Rework")
+        post_feedback_and_rework(issue, feedback)
+      end
     end
   end
 
-  defp handle_review_result({:error, reason}, issue) do
+  defp handle_review_result({:error, reason}, issue, _workspace, _iteration, _max_iterations) do
     Logger.error("Review turn failed for #{issue_context(issue)}: #{inspect(reason)}")
     {:error, reason}
   end
@@ -129,19 +155,16 @@ defmodule SymphonyElixir.ReviewRunner do
   defp extract_review_text(response) when is_binary(response), do: response
   defp extract_review_text(_response), do: ""
 
-  defp parse_verdict(review_text) when is_binary(review_text) do
-    uppercased = String.upcase(review_text)
+  defp post_feedback_comment(issue, feedback) do
+    comment = format_review_comment(feedback)
 
-    cond do
-      Enum.any?(@approved_signals, &String.contains?(uppercased, &1)) ->
-        :approved
+    case Tracker.create_comment(issue.id, comment) do
+      :ok ->
+        :ok
 
-      Enum.any?(@rejected_signals, &String.contains?(uppercased, &1)) ->
-        :changes_requested
-
-      true ->
-        # Default to changes_requested for safety — require explicit approval
-        :changes_requested
+      {:error, reason} ->
+        Logger.error("Failed to post review feedback for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, {:comment_post_failed, reason}}
     end
   end
 
@@ -155,17 +178,13 @@ defmodule SymphonyElixir.ReviewRunner do
           :ok
 
         {:error, reason} ->
-          Logger.error(
-            "Failed to transition #{issue_context(issue)} to Fix/Rework: #{inspect(reason)}"
-          )
+          Logger.error("Failed to transition #{issue_context(issue)} to Fix/Rework: #{inspect(reason)}")
 
           {:error, {:state_transition_failed, reason}}
       end
     else
       {:error, reason} ->
-        Logger.error(
-          "Failed to post review feedback for #{issue_context(issue)}: #{inspect(reason)}"
-        )
+        Logger.error("Failed to post review feedback for #{issue_context(issue)}: #{inspect(reason)}")
 
         {:error, {:comment_post_failed, reason}}
     end
@@ -180,6 +199,32 @@ defmodule SymphonyElixir.ReviewRunner do
     ---
     _Generated by Symphony review agent_
     """
+  end
+
+  defp maybe_archive_plan(issue, workspace) do
+    json_path = Path.join(workspace, "PLAN.json")
+
+    case File.read(json_path) do
+      {:ok, json} ->
+        case Plan.from_json(json) do
+          {:ok, plan} ->
+            base_path = Config.settings!().workspace.root
+            KnowledgeBase.archive_plan(issue.id, plan, base_path)
+
+          {:error, _} ->
+            :ok
+        end
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  defp max_review_iterations do
+    case Map.get(Config.settings!().pipeline, :max_review_iterations) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> @default_max_review_iterations
+    end
   end
 
   defp agent_message_handler(recipient, issue) do

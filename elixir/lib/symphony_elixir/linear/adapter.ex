@@ -55,6 +55,33 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @label_lookup_query """
+  query SymphonyResolveLabelId($issueId: String!, $labelName: String!) {
+    issue(id: $issueId) {
+      labels {
+        nodes {
+          id
+        }
+      }
+      team {
+        labels(filter: {name: {eqCaseInsensitive: $labelName}}, first: 1) {
+          nodes {
+            id
+          }
+        }
+      }
+    }
+  }
+  """
+
+  @update_labels_mutation """
+  mutation SymphonyUpdateIssueLabels($issueId: String!, $labelIds: [String!]!) {
+    issueUpdate(id: $issueId, input: {labelIds: $labelIds}) {
+      success
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 
@@ -111,6 +138,42 @@ defmodule SymphonyElixir.Linear.Adapter do
     else
       nil -> {:ok, []}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec add_label(String.t(), String.t()) :: :ok | {:error, term()}
+  def add_label(issue_id, label_name) when is_binary(issue_id) and is_binary(label_name) do
+    with {:ok, response} <-
+           client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}),
+         {:ok, current_label_ids} <- extract_current_label_ids(response),
+         {:ok, new_label_id} <- extract_team_label_id(response),
+         combined_ids <- Enum.uniq([new_label_id | current_label_ids]),
+         {:ok, update_response} <-
+           client_module().graphql(@update_labels_mutation, %{issueId: issue_id, labelIds: combined_ids}),
+         true <- get_in(update_response, ["data", "issueUpdate", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :label_update_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :label_update_failed}
+    end
+  end
+
+  defp extract_current_label_ids(response) do
+    case get_in(response, ["data", "issue", "labels", "nodes"]) do
+      nodes when is_list(nodes) ->
+        ids = Enum.map(nodes, & &1["id"]) |> Enum.reject(&is_nil/1)
+        {:ok, ids}
+
+      _ ->
+        {:ok, []}
+    end
+  end
+
+  defp extract_team_label_id(response) do
+    case get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
+      id when is_binary(id) -> {:ok, id}
+      _ -> {:error, :label_not_found}
     end
   end
 

@@ -73,12 +73,14 @@ defmodule SymphonyElixir.AgentBackend.ClaudeCode.NdjsonParser do
   @spec map_event_type(map()) :: atom()
   def map_event_type(%{"type" => "system", "subtype" => "init"}), do: :session_init
   def map_event_type(%{"type" => "system"}), do: :system
+
   def map_event_type(%{"type" => "assistant", "message" => %{"content" => content}})
       when is_list(content) do
     if Enum.any?(content, &(&1["type"] == "tool_use")),
       do: :tool_use,
       else: :assistant_message
   end
+
   def map_event_type(%{"type" => "assistant"}), do: :assistant_message
   def map_event_type(%{"type" => "user"}), do: :user_message
   def map_event_type(%{"type" => "result", "subtype" => "success"}), do: :turn_completed
